@@ -2,6 +2,8 @@
 
 FinAgent is a conversational AI agent that lets you ask natural-language questions about any personal expense spreadsheet. It is built on Claude's **tool-use (function calling) API**: rather than dumping the entire spreadsheet into a prompt, Claude decides at runtime which typed data-retrieval function to call, gets back a focused JSON result, and synthesises a plain-English answer. Point it at any Excel file — it auto-detects the sheet name, column positions, date format, expense categories, and whether a pre-aggregated dashboard exists. The architecture directly mirrors how production fintech platforms (Plaid, Yodlee, MX) expose financial data — as structured, queryable endpoints — making this a realistic demonstration of agentic reasoning over financial data.
 
+**Stack:** Python 3.9+ · Anthropic SDK · pandas · openpyxl · python-dotenv
+
 ---
 
 ## Full architecture
@@ -76,7 +78,8 @@ FinAgent/
 ├── agent.py         Agentic loop — dynamic system prompt, tool dispatch
 ├── config.py        API key, model, Excel path, fallback budget
 ├── main.py          CLI loop — inspection banner, reload command
-├── .env             Secrets (not committed)
+├── .env             Secrets (not committed — copy from .env.example)
+├── .env.example     Required environment variable template
 ├── requirements.txt
 └── README.md
 ```
@@ -194,15 +197,21 @@ Tool JSON schemas are generated at runtime with `build_tool_definitions(categori
 
 ## Setup
 
+**Requirements:** Python 3.9+, pip
+
 ```bash
 pip install -r requirements.txt
 ```
 
-Create a `.env` file in the project root:
+Copy `.env.example` to `.env` and fill in your values:
 ```
 ANTHROPIC_API_KEY=sk-ant-...
 EXCEL_PATH=C:\path\to\your_expenses.xlsx
 ```
+
+`EXCEL_PATH` is required — there is no safe default. `ANTHROPIC_API_KEY` must be a valid key from [console.anthropic.com](https://console.anthropic.com).
+
+**Model:** `claude-sonnet-4-5` (set in `config.py` → `MODEL`). Change this to any Anthropic model that supports tool use.
 
 Run:
 ```bash
