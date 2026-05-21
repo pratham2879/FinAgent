@@ -1,12 +1,14 @@
 # FinAgent — Personal Expense Analyst
 
-FinAgent is a conversational AI agent that lets you ask natural-language questions about any personal expense spreadsheet. It is built on Claude's **tool-use (function calling) API**: rather than dumping the entire spreadsheet into a prompt, Claude decides at runtime which typed data-retrieval function to call, gets back a focused JSON result, and synthesises a plain-English answer. Point it at any Excel file — it auto-detects the sheet name, column positions, date format, expense categories, and whether a pre-aggregated dashboard exists. The architecture directly mirrors how production fintech platforms (Plaid, Yodlee, MX) expose financial data — as structured, queryable endpoints — making this a realistic demonstration of agentic reasoning over financial data.
+As a student, manually logging every transaction and keeping track of where your money goes gets tedious fast. I built this because I wanted to ask plain-English questions about my spending without manually digging through spreadsheets. You point it at any `.xlsx` expense file, and it figures out the structure on its own — sheet names, column layout, categories, budget, everything. Then you just ask things like "was I over budget in March?" and it answers.
+
+Under the hood it uses Claude's **tool-use API**: instead of dumping the whole spreadsheet into a prompt, Claude calls typed Python functions to fetch exactly the data it needs, gets back focused JSON, and writes a plain-English answer. It's the same pattern Plaid and Yodlee use — expose financial data as structured endpoints, let the AI query them.
 
 **Stack:** Python 3.9+ · Anthropic SDK · pandas · openpyxl · python-dotenv
 
 ---
 
-## Full architecture
+## How it works
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -86,45 +88,45 @@ FinAgent/
 
 ---
 
-## How the inspector works (inspector.py)
+## The inspector (inspector.py)
 
-On first query the inspector scans the file once and caches an `ExcelSchema`. No column names, sheet names, or row positions are hardcoded anywhere else.
+The first time you ask a question, the inspector scans the file once and caches an `ExcelSchema`. Nothing else in the codebase has hardcoded sheet names, column positions, or category lists — they all come from this.
 
 **Step 1 — Find the transaction sheet**
-Each sheet is scored: +2 per keyword match in the sheet name (`transactions`, `data`, `expenses`, …) plus a content score from scanning the first 20 rows for recognisable column headers. Highest score wins.
+Each sheet gets a score: +2 per keyword match in the name (`transactions`, `data`, `expenses`, …) plus a content score from scanning the first 20 rows for recognisable column headers. Highest score wins.
 
 **Step 2 — Detect the header row**
-Rows 1–20 are scored by how many of 7 keyword sets they cover (date, month, description, category, amount, payment, notes). Bonus points for having both `amount` and `category`. The top-scoring row is the header.
+Rows 1–20 are scored by how many of 7 keyword sets they cover (date, month, description, category, amount, payment, notes). Bonus points for having both `amount` and `category`. The top-scoring row becomes the header.
 
 **Step 3 — Map column roles**
-Each header cell is fuzzy-matched against keyword sets (e.g. `"Amount ($)"` → strips `($)` → matches `amount`). Original column name is stored so pandas `rename()` can map it to the internal standard name.
+Each header cell is fuzzy-matched against keyword sets — so `"Amount ($)"` strips the `($)` and matches `amount`. The original column name is kept so pandas can rename it to the internal standard.
 
 **Step 4 — Find the dashboard**
-Sheets named `dashboard`, `summary`, `overview`, etc. are checked for a column where ≥ 3 values match the month-string pattern (`Aug-25`, `Mar-26`, …). The row above the first month value is the header row. Columns are collected left-to-right until the first `TOTAL` column or the first None gap — this stops the scanner from leaking into unrelated tables on the same sheet (e.g. a "Utilities Breakdown" to the right).
+Sheets named `dashboard`, `summary`, `overview`, etc. are checked for a column with ≥ 3 values matching the month-string pattern (`Aug-25`, `Mar-26`, …). Columns are collected left-to-right until the first `TOTAL` column or a None gap — this prevents the scanner from picking up unrelated tables sitting to the right on the same sheet.
 
 **Step 5 — Detect budget**
 Scans the dashboard for a cell labelled "budget" and returns the nearest adjacent number.
 
 ---
 
-## Dual data-source design (the non-obvious part)
+## Why two data sources
 
-The agent reads from two different sheets for different query types:
+This was the trickiest design decision. I initially read everything from the Transactions sheet, but monthly totals kept coming out wrong. It turned out my spreadsheet had fixed costs like Rent hardcoded directly in Dashboard cells — they were never logged as individual transactions.
+
+The fix was to treat the two sheets like separate database layers:
 
 ```
 Transactions sheet  →  get_top_merchants(), get_transactions()
-                        needed for row-level detail (merchant, date, amount)
+                        row-level detail: merchant, date, individual amount
 
 Dashboard sheet     →  get_spending_by_category(), get_monthly_summary(), compare_months()
-    read with           needed because some spreadsheets hardcode fixed costs
-    data_only=True      (e.g. Rent = $420) directly in Dashboard cells rather
-                        than as individual transactions — reading only the
-                        Transactions sheet silently under-counts those months
+    read with           pre-aggregated totals that include fixed costs not in
+    data_only=True      the transaction log — this is the authoritative source
 ```
 
-If no dashboard is detected, all five tools fall back to aggregating from the Transactions sheet automatically.
+If no dashboard exists, all five tools fall back to aggregating from transactions automatically.
 
-**Interview talking point:** "Reading only the Transactions sheet gave wrong monthly totals — Rent was hardcoded in the Dashboard. I fixed it by treating the Dashboard as the OLAP layer (pre-aggregated, authoritative totals read with `data_only=True`) and the Transactions sheet as the OLTP layer (row-level detail for filtering). That's the same separation used in production financial data warehouses."
+This is the same OLTP/OLAP separation used in production data warehouses — transactions for row-level queries, a pre-aggregated layer for summary queries.
 
 ---
 
@@ -165,7 +167,7 @@ for _ in range(MAX_ITERATIONS):          # hard cap = 5
     # Claude sees results and either calls more tools or gives a final answer
 ```
 
-**Why multiple tool calls per turn matter:** "Did I spend more on food in March than February?" requires data from two months. Claude issues both `get_spending_by_category` calls in a single response. The loop executes them together and sends both results back in one round-trip.
+One thing worth noting: Claude can issue multiple tool calls in a single turn. A question like "did I spend more on food in March than February?" requires data from two months — Claude requests both `get_spending_by_category` calls at once, the loop executes them together, and both results go back in one round-trip.
 
 ---
 
@@ -179,19 +181,19 @@ for _ in range(MAX_ITERATIONS):          # hard cap = 5
 | `get_top_merchants(month, year, n=5)` | Transactions | Top N stores by total spend |
 | `get_transactions(month, year, category?, min_amount?)` | Transactions | Filtered line-item list |
 
-Tool JSON schemas are generated at runtime with `build_tool_definitions(categories)` — the detected category list is injected into each schema description so Claude always knows the valid values for the current file.
+Tool JSON schemas are generated at runtime via `build_tool_definitions(categories)` — the detected category list is injected so Claude always knows the valid values for the current file.
 
 ---
 
-## Why function calling instead of prompt-stuffing
+## Why function calling instead of dumping the spreadsheet into the prompt
 
-1. **Token efficiency.** 100+ transactions × every message = thousands of tokens wasted. Tool calls retrieve only the slice each question needs.
+1. **Token efficiency.** 100+ transactions × every message = thousands of tokens per query. Tool calls fetch only the slice each question actually needs.
 
-2. **Deterministic arithmetic.** LLMs mis-add numbers when given raw data. Tool functions run in Python — the maths is always correct.
+2. **Correct arithmetic.** LLMs make arithmetic mistakes on raw data. Tool functions run in Python — the numbers are always right.
 
-3. **Scales with data.** A 500-row sheet works identically to a 100-row sheet when queried via typed functions. Prompt-stuffing degrades linearly with size.
+3. **Scales cleanly.** A 500-row sheet works the same as a 50-row sheet when data comes through typed functions. Prompt-stuffing gets worse as the file grows.
 
-4. **Production pattern.** Plaid's `/transactions/get`, Yodlee's `/transactions`, and MX's `/transactions` all work this way — the AI calls a typed endpoint and gets structured JSON back. FinAgent uses the identical pattern at personal scale.
+4. **Matches how real finance APIs work.** Plaid's `/transactions/get`, Yodlee's `/transactions`, MX's `/transactions` — the AI calls a typed endpoint and gets structured JSON back. FinAgent is the same pattern at personal scale.
 
 ---
 
@@ -209,16 +211,15 @@ ANTHROPIC_API_KEY=sk-ant-...
 EXCEL_PATH=C:\path\to\your_expenses.xlsx
 ```
 
-`EXCEL_PATH` is required — there is no safe default. `ANTHROPIC_API_KEY` must be a valid key from [console.anthropic.com](https://console.anthropic.com).
+`EXCEL_PATH` is required — there's no built-in default. Get your API key from [console.anthropic.com](https://console.anthropic.com).
 
-**Model:** `claude-sonnet-4-5` (set in `config.py` → `MODEL`). Change this to any Anthropic model that supports tool use.
+**Model:** defaults to `claude-sonnet-4-5`, set in `config.py` → `MODEL`. Any Anthropic model with tool use support will work.
 
-Run:
 ```bash
 python main.py
 ```
 
-On startup FinAgent prints everything it detected about your file:
+On startup it prints everything it detected about your file:
 ```
   File    : Student_Expense_Tracker.xlsx
   Sheet   : Transactions  (header row 4)
@@ -229,7 +230,7 @@ On startup FinAgent prints everything it detected about your file:
   Dashboard: 'Dashboard' — 8 category columns detected
 ```
 
-Type `reload` at the prompt to re-inspect the file after edits.
+Type `reload` at the prompt to re-inspect the file after making edits.
 
 ---
 
